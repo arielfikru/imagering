@@ -1,0 +1,10 @@
+build/
+dist/
+test/bin/
+test/fixtures/
+test/work/
+test/render*/
+test/*.txt
+design/.build/
+.DS_Store
+CLAUDE.md

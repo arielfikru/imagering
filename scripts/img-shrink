@@ -1,0 +1,128 @@
+#!/bin/bash
+# img-shrink — compress images to fit under a target file size (JPEG output).
+#
+# Usage:  img-shrink <target> <file>...
+#   target: 1MB, 500KB, 2.5MB, 1 (= MB), or "ask" (shows a dialog)
+# Output: "<name>-<target>.jpg" next to the original. Original is never touched.
+# 1 MB = 1,000,000 bytes (same units Finder shows).
+# Bundled in ImageRing.app/Contents/Resources and used by the Compress actions.
+
+set -u
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+SIPS=/usr/bin/sips
+Q_MIN=60
+Q_MAX=92
+
+notify() { # title, message
+  /usr/bin/osascript -e 'on run argv' -e 'display notification (item 2 of argv) with title (item 1 of argv)' -e 'end run' "$1" "$2" >/dev/null 2>&1
+}
+
+human() { # bytes -> "1.23 MB" / "456 KB"
+  awk -v b="$1" 'BEGIN{ if (b>=1000000) printf "%.2f MB", b/1000000; else printf "%d KB", b/1000 }'
+}
+
+fsize() { stat -f%z "$1"; }
+
+# ---- parse target ----------------------------------------------------------
+target_in="${1:-}"; shift || true
+if [ "$target_in" = "ask" ]; then
+  target_in=$(/usr/bin/osascript \
+    -e 'set r to display dialog "Target ukuran (contoh: 1MB, 500KB, 2.5MB):" default answer "1MB" with title "Shrink Image" buttons {"Batal", "OK"} default button "OK" cancel button "Batal"' \
+    -e 'text returned of r' 2>/dev/null) || exit 0
+fi
+t=$(printf '%s' "$target_in" | tr -d ' ' | tr '[:lower:]' '[:upper:]' | tr ',' '.')
+case "$t" in
+  *KB) num="${t%KB}"; mult=1000 ;;
+  *K)  num="${t%K}";  mult=1000 ;;
+  *MB) num="${t%MB}"; mult=1000000 ;;
+  *M)  num="${t%M}";  mult=1000000 ;;
+  *)   num="$t";      mult=1000000 ;;
+esac
+if ! printf '%s' "$num" | grep -Eq '^[0-9]+(\.[0-9]+)?$'; then
+  notify "Shrink Image" "Target tidak valid: $target_in"; echo "invalid target: $target_in" >&2; exit 2
+fi
+TARGET=$(awk -v n="$num" -v m="$mult" 'BEGIN{ printf "%d", n*m }')
+if [ "$TARGET" -lt 10000 ]; then
+  notify "Shrink Image" "Target terlalu kecil (min 10KB)"; exit 2
+fi
+LABEL=$(printf '%s' "$num" | sed 's/\.0*$//')$( [ "$mult" = 1000 ] && echo KB || echo MB )
+
+[ $# -eq 0 ] && { echo "usage: img-shrink <target> <file>..." >&2; exit 2; }
+
+TMP=$(mktemp -d /tmp/img-shrink.XXXXXX)
+trap 'rm -rf "$TMP"' EXIT
+
+encode() { # src, quality, out
+  "$SIPS" -s format jpeg -s formatOptions "$2" "$1" --out "$3" >/dev/null 2>&1
+}
+
+# Finds the highest quality <= TARGET for src. Echoes the quality, or nothing.
+search_quality() { # src
+  local src="$1" lo=$Q_MIN hi=$Q_MAX best="" mid
+  encode "$src" "$lo" "$TMP/try.jpg" || return 1
+  [ "$(fsize "$TMP/try.jpg")" -gt "$TARGET" ] && { echo "TOO_BIG $(fsize "$TMP/try.jpg")"; return 0; }
+  best=$lo; cp "$TMP/try.jpg" "$TMP/best.jpg"
+  while [ $((hi - lo)) -gt 2 ]; do
+    mid=$(( (lo + hi + 1) / 2 ))
+    encode "$src" "$mid" "$TMP/try.jpg" || return 1
+    if [ "$(fsize "$TMP/try.jpg")" -le "$TARGET" ]; then
+      best=$mid; lo=$mid; cp "$TMP/try.jpg" "$TMP/best.jpg"
+    else
+      hi=$mid
+    fi
+  done
+  echo "OK $best"
+}
+
+ok=0; skipped=0; failed=0; last_msg=""
+for f in "$@"; do
+  [ -f "$f" ] || continue
+  name=$(basename "$f")
+  size=$(fsize "$f")
+  if [ "$size" -le "$TARGET" ]; then
+    skipped=$((skipped+1)); last_msg="$name sudah $(human "$size") (≤ $LABEL), dilewati"
+    echo "skip: $f ($(human "$size"))"; continue
+  fi
+  w=$("$SIPS" -g pixelWidth "$f" 2>/dev/null | awk '/pixelWidth/{print $2}')
+  h=$("$SIPS" -g pixelHeight "$f" 2>/dev/null | awk '/pixelHeight/{print $2}')
+  if [ -z "$w" ] || [ -z "$h" ]; then
+    failed=$((failed+1)); last_msg="$name bukan gambar yang bisa dibaca"; echo "fail: $f" >&2; continue
+  fi
+  maxdim=$(( w > h ? w : h ))
+  dim=$maxdim; src="$f"; result=""; tries=0
+  rm -f "$TMP/best.jpg"
+  while [ $tries -lt 10 ]; do
+    tries=$((tries+1))
+    r=$(search_quality "$src") || { result=""; break; }
+    case "$r" in
+      OK*) result="$r"; break ;;
+      TOO_BIG*)
+        got=${r#TOO_BIG }
+        # scale area roughly by target/got, with a safety margin
+        dim=$(awk -v d="$dim" -v t="$TARGET" -v g="$got" 'BEGIN{ n=int(d*sqrt(t/g)*0.93); if (n>=d) n=int(d*0.85); print n }')
+        [ "$dim" -lt 64 ] && break
+        "$SIPS" -s format tiff -Z "$dim" "$f" --out "$TMP/src.tiff" >/dev/null 2>&1 || break
+        src="$TMP/src.tiff" ;;
+    esac
+  done
+  if [ -z "$result" ] || [ ! -f "$TMP/best.jpg" ]; then
+    failed=$((failed+1)); last_msg="Gagal mengecilkan $name"; echo "fail: $f" >&2; continue
+  fi
+  out="${f%.*}-$LABEL.jpg"; n=2
+  while [ -e "$out" ]; do out="${f%.*}-$LABEL-$n.jpg"; n=$((n+1)); done
+  mv "$TMP/best.jpg" "$out"
+  new=$(fsize "$out")
+  nw=$("$SIPS" -g pixelWidth "$out" | awk '/pixelWidth/{print $2}')
+  nh=$("$SIPS" -g pixelHeight "$out" | awk '/pixelHeight/{print $2}')
+  ok=$((ok+1))
+  last_msg="$name: $(human "$size") → $(human "$new") (${nw}×${nh}, q${result#OK })"
+  echo "ok: $out  $(human "$size") -> $(human "$new")  ${w}x${h} -> ${nw}x${nh}  q${result#OK }"
+done
+
+total=$((ok+skipped+failed))
+if [ "$total" -eq 1 ]; then
+  notify "Shrink Image → $LABEL" "$last_msg"
+else
+  notify "Shrink Image → $LABEL" "$ok berhasil, $skipped dilewati, $failed gagal"
+fi
+[ "$failed" -eq 0 ]
